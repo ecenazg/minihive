@@ -4,10 +4,11 @@ import unittest
 import luigi
 import sqlparse
 
-import ra2mr
-import raopt
-import sql2ra
-import test_ra2mr
+from milestone3 import ra2mr as ra2mr
+from milestone3 import raopt
+from milestone3 import sql2ra
+from milestone3 import test_ra2mr
+
 
 '''
 May be called like any Python unittest, or using pytest, e.g. "pytest test_e2e.py -p no:warnings".

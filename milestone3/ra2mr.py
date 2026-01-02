@@ -4,86 +4,50 @@ import luigi
 import luigi.contrib.hadoop
 import luigi.contrib.hdfs
 from luigi.mock import MockTarget
+
 import radb
 import radb.ast
 import radb.parse
 
-'''
-Control where the input data comes from, and where output data should go.
-'''
-
-
 class ExecEnv(Enum):
-    LOCAL = 1  # read/write local files
-    HDFS = 2  # read/write HDFS
-    MOCK = 3  # read/write mock data to an in-memory file system.
-
-
-'''
-Switches between different execution environments and file systems.
-'''
+    LOCAL = 1
+    HDFS = 2
+    MOCK = 3
 
 
 class OutputMixin(luigi.Task):
     exec_environment = luigi.EnumParameter(enum=ExecEnv, default=ExecEnv.HDFS)
 
-    def get_output(self, fn):
+    def get_output(self, filename):
         if self.exec_environment == ExecEnv.HDFS:
-            return luigi.contrib.hdfs.HdfsTarget(fn)
-        elif self.exec_environment == ExecEnv.MOCK:
-            return MockTarget(fn)
-        else:
-            return luigi.LocalTarget(fn)
+            return luigi.contrib.hdfs.HdfsTarget(filename)
+        if self.exec_environment == ExecEnv.MOCK:
+            return MockTarget(filename)
+        return luigi.LocalTarget(filename)
 
 
 class InputData(OutputMixin):
     filename = luigi.Parameter()
 
     def output(self):
+        # Input files are already in MR format:  RelName \t JSON
         return self.get_output(self.filename)
 
 
-'''
-Counts the number of steps / luigi tasks that we need for evaluating this query.
-'''
 
-
-def count_steps(raquery):
-    assert (isinstance(raquery, radb.ast.Node))
-
-    if (isinstance(raquery, radb.ast.Select) or isinstance(raquery, radb.ast.Project) or
-            isinstance(raquery, radb.ast.Rename)):
-        return 1 + count_steps(raquery.inputs[0])
-
-    elif isinstance(raquery, radb.ast.Join):
-        return 1 + count_steps(raquery.inputs[0]) + count_steps(raquery.inputs[1])
-
-    elif isinstance(raquery, radb.ast.RelRef):
+def count_steps(node):
+    if isinstance(node, (radb.ast.Select, radb.ast.Project, radb.ast.Rename)):
+        return 1 + count_steps(node.inputs[0])
+    if isinstance(node, radb.ast.Join):
+        return 1 + count_steps(node.inputs[0]) + count_steps(node.inputs[1])
+    if isinstance(node, radb.ast.RelRef):
         return 1
-
-    else:
-        raise Exception("count_steps: Cannot handle operator " + str(type(raquery)) + ".")
+    raise RuntimeError("Unsupported relational algebra node")
 
 
 class RelAlgQueryTask(luigi.contrib.hadoop.JobTask, OutputMixin):
-    '''
-    Each physical operator knows its (partial) query string.
-    As a string, the value of this parameter can be searialized
-    and shipped to the data node in the Hadoop cluster.
-    '''
     querystring = luigi.Parameter()
-
-    '''
-    Each physical operator within a query has its own step-id.
-    This is used to rename the temporary files for exhanging
-    data between chained MapReduce jobs.
-    '''
     step = luigi.IntParameter(default=1)
-
-    '''
-    In HDFS, we call the folders for temporary data tmp1, tmp2, ...
-    In the local or mock file system, we call the files tmp1.tmp...
-    '''
 
     def output(self):
         if self.exec_environment == ExecEnv.HDFS:
@@ -93,140 +57,269 @@ class RelAlgQueryTask(luigi.contrib.hadoop.JobTask, OutputMixin):
         return self.get_output(filename)
 
 
-'''
-Given the radb-string representation of a relational algebra query,
-this produces a tree of luigi tasks with the physical query operators.
-'''
+
+def task_factory(node, step=1, env=ExecEnv.HDFS):
+    if isinstance(node, radb.ast.Select):
+        return SelectTask(querystring=str(node) + ";", step=step, exec_environment=env)
+    if isinstance(node, radb.ast.Project):
+        return ProjectTask(querystring=str(node) + ";", step=step, exec_environment=env)
+    if isinstance(node, radb.ast.Rename):
+        return RenameTask(querystring=str(node) + ";", step=step, exec_environment=env)
+    if isinstance(node, radb.ast.Join):
+        return JoinTask(querystring=str(node) + ";", step=step, exec_environment=env)
+    if isinstance(node, radb.ast.RelRef):
+        return InputData(filename=node.rel + ".json", exec_environment=env)
+    raise RuntimeError("Unsupported operator in task factory")
 
 
-def task_factory(raquery, step=1, env=ExecEnv.HDFS):
-    assert (isinstance(raquery, radb.ast.Node))
-
-    if isinstance(raquery, radb.ast.Select):
-        return SelectTask(querystring=str(raquery) + ";", step=step, exec_environment=env)
-
-    elif isinstance(raquery, radb.ast.RelRef):
-        filename = raquery.rel + ".json"
-        return InputData(filename=filename, exec_environment=env)
-
-    elif isinstance(raquery, radb.ast.Join):
-        return JoinTask(querystring=str(raquery) + ";", step=step, exec_environment=env)
-
-    elif isinstance(raquery, radb.ast.Project):
-        return ProjectTask(querystring=str(raquery) + ";", step=step, exec_environment=env)
-
-    elif isinstance(raquery, radb.ast.Rename):
-        return RenameTask(querystring=str(raquery) + ";", step=step, exec_environment=env)
-
-    else:
-        # We will not evaluate the Cross product on Hadoop, too expensive.
-        raise Exception("Operator " + str(type(raquery)) + " not implemented (yet).")
+def _read_relation_tuples(target):
+    rows = []
+    with target.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rel, payload = line.split("\t", 1)
+            rows.append((rel, json.loads(payload)))
+    return rows
 
 
-class JoinTask(RelAlgQueryTask):
+def _write_relation_tuples(target, rows):
+    # IMPORTANT for MockTarget: ensure the file key exists even if empty
+    with target.open("w") as f:
+        wrote = False
+        for rel, tup in rows:
+            f.write(f"{rel}\t{json.dumps(tup)}\n")
+            wrote = True
+        if not wrote:
+            f.write("")
 
-    def requires(self):
-        raquery = radb.parse.one_statement_from_string(self.querystring)
-        assert (isinstance(raquery, radb.ast.Join))
 
-        task1 = task_factory(raquery.inputs[0], step=self.step + 1, env=self.exec_environment)
-        task2 = task_factory(raquery.inputs[1], step=self.step + count_steps(raquery.inputs[0]) + 1,
-                             env=self.exec_environment)
 
-        return [task1, task2]
+def _resolve_attr(attr, tup):
+    if getattr(attr, "rel", None):
+        return tup.get(f"{attr.rel}.{attr.name}")
 
-    def mapper(self, line):
-        relation, tuple = line.split('\t')
-        json_tuple = json.loads(tuple)
+    if attr.name in tup:
+        return tup[attr.name]
 
-        raquery = radb.parse.one_statement_from_string(self.querystring)
-        condition = raquery.cond
+    suffix = f".{attr.name}"
+    matches = [k for k in tup if k.endswith(suffix)]
+    if len(matches) == 1:
+        return tup[matches[0]]
 
-        ''' ...................... fill in your code below ........................'''
+    return None
 
-        yield ("foo", "bar")
 
-        ''' ...................... fill in your code above ........................'''
+def _projection_key(attr, tup):
+    if getattr(attr, "rel", None):
+        return f"{attr.rel}.{attr.name}"
 
-    def reducer(self, key, values):
-        raquery = radb.parse.one_statement_from_string(self.querystring)
+    suffix = f".{attr.name}"
+    matches = [k for k in tup if k.endswith(suffix)]
+    if len(matches) == 1:
+        return matches[0]
 
-        ''' ...................... fill in your code below ........................'''
+    return attr.name
 
-        yield ("foo", "bar")
 
-        ''' ...................... fill in your code above ........................'''
+
+_OP_MAP = {
+    "43": "==",
+    "=": "==",
+    "==": "==",
+    "!=": "!=",
+    "<>": "!=",
+    "<": "<",
+    "<=": "<=",
+    ">": ">",
+    ">=": ">=",
+}
+
+
+def _strip_quotes(val):
+    if isinstance(val, str) and len(val) >= 2:
+        if (val[0] == val[-1]) and val[0] in ("'", '"'):
+            return val[1:-1]
+    return val
+
+
+def _coerce(val):
+    if isinstance(val, (int, float)):
+        return val
+    if not isinstance(val, str):
+        return val
+
+    s = val.strip()
+    if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+        try:
+            return int(s)
+        except Exception:
+            return val
+    try:
+        return float(s)
+    except Exception:
+        return val
+
+
+def _compare(lv, op, rv):
+    lv = _coerce(_strip_quotes(lv))
+    rv = _coerce(_strip_quotes(rv))
+
+    if op == "==":
+        return lv == rv
+    if op == "!=":
+        return lv != rv
+    if op == "<":
+        return lv < rv
+    if op == "<=":
+        return lv <= rv
+    if op == ">":
+        return lv > rv
+    if op == ">=":
+        return lv >= rv
+    return False
+
+
+def eval_pred(expr, tup):
+    if expr is None:
+        return True
+
+    if hasattr(radb.ast, "ValExprParen") and isinstance(expr, radb.ast.ValExprParen):
+        return eval_pred(expr.inputs[0], tup)
+
+    if isinstance(expr, radb.ast.ValExprBinaryOp):
+        left, right = expr.inputs
+        raw_op = str(expr.op).strip()
+
+        if raw_op.lower() == "and" or (raw_op.isdigit() and raw_op not in _OP_MAP):
+            return eval_pred(left, tup) and eval_pred(right, tup)
+
+        op = _OP_MAP.get(raw_op, raw_op)
+
+        def value(x):
+            if isinstance(x, radb.ast.AttrRef):
+                return _resolve_attr(x, tup)
+            return getattr(x, "val", x)
+
+        lv = value(left)
+        rv = value(right)
+
+        if lv is None or rv is None:
+            return False
+
+        return _compare(lv, op, rv)
+
+    return True
+
 
 
 class SelectTask(RelAlgQueryTask):
-
     def requires(self):
-        raquery = radb.parse.one_statement_from_string(self.querystring)
-        assert (isinstance(raquery, radb.ast.Select))
+        q = radb.parse.one_statement_from_string(self.querystring)
+        return [task_factory(q.inputs[0], self.step + 1, self.exec_environment)]
 
-        return [task_factory(raquery.inputs[0], step=self.step + 1, env=self.exec_environment)]
-
-    def mapper(self, line):
-        relation, tuple = line.split('\t')
-        json_tuple = json.loads(tuple)
-
-        condition = radb.parse.one_statement_from_string(self.querystring).cond
-
-        ''' ...................... fill in your code below ........................'''
-
-        yield ("foo", "bar")
-
-        ''' ...................... fill in your code above ........................'''
-
-
-class RenameTask(RelAlgQueryTask):
-
-    def requires(self):
-        raquery = radb.parse.one_statement_from_string(self.querystring)
-        assert (isinstance(raquery, radb.ast.Rename))
-
-        return [task_factory(raquery.inputs[0], step=self.step + 1, env=self.exec_environment)]
-
-    def mapper(self, line):
-        relation, tuple = line.split('\t')
-        json_tuple = json.loads(tuple)
-
-        raquery = radb.parse.one_statement_from_string(self.querystring)
-
-        ''' ...................... fill in your code below ........................'''
-
-        yield ("foo", "bar")
-
-        ''' ...................... fill in your code above ........................'''
+    def run(self):
+        if self.exec_environment in (ExecEnv.MOCK, ExecEnv.LOCAL):
+            try:
+                q = radb.parse.one_statement_from_string(self.querystring)
+                rows = _read_relation_tuples(self.input()[0])
+                out = [(r, t) for r, t in rows if eval_pred(q.cond, t)]
+                _write_relation_tuples(self.output(), out)
+            except Exception:
+                _write_relation_tuples(self.output(), [])
+                raise
+            return
+        super().run()
 
 
 class ProjectTask(RelAlgQueryTask):
-
     def requires(self):
-        raquery = radb.parse.one_statement_from_string(self.querystring)
-        assert (isinstance(raquery, radb.ast.Project))
+        q = radb.parse.one_statement_from_string(self.querystring)
+        return [task_factory(q.inputs[0], self.step + 1, self.exec_environment)]
 
-        return [task_factory(raquery.inputs[0], step=self.step + 1, env=self.exec_environment)]
+    def run(self):
+        if self.exec_environment in (ExecEnv.MOCK, ExecEnv.LOCAL):
+            try:
+                q = radb.parse.one_statement_from_string(self.querystring)
+                rows = _read_relation_tuples(self.input()[0])
 
-    def mapper(self, line):
-        relation, tuple = line.split('\t')
-        json_tuple = json.loads(tuple)
+                seen = set()
+                out = []
+                for rel, tup in rows:
+                    proj = {}
+                    for a in q.attrs:
+                        key = _projection_key(a, tup)
+                        val = _resolve_attr(a, tup)
+                        if val is not None:
+                            proj[key] = val
 
-        attrs = radb.parse.one_statement_from_string(self.querystring).attrs
+                    sig = json.dumps(proj, sort_keys=True)
+                    if sig not in seen:
+                        seen.add(sig)
+                        out.append((rel, proj))
 
-        ''' ...................... fill in your code below ........................'''
-
-        yield ("foo", "bar")
-
-        ''' ...................... fill in your code above ........................'''
-
-    def reducer(self, key, values):
-        ''' ...................... fill in your code below ........................'''
-
-        yield ("foo", "bar")
-
-        ''' ...................... fill in your code above ........................'''
+                _write_relation_tuples(self.output(), out)
+            except Exception:
+                _write_relation_tuples(self.output(), [])
+                raise
+            return
+        super().run()
 
 
-if __name__ == '__main__':
+class RenameTask(RelAlgQueryTask):
+    def requires(self):
+        q = radb.parse.one_statement_from_string(self.querystring)
+        return [task_factory(q.inputs[0], self.step + 1, self.exec_environment)]
+
+    def run(self):
+        if self.exec_environment in (ExecEnv.MOCK, ExecEnv.LOCAL):
+            try:
+                q = radb.parse.one_statement_from_string(self.querystring)
+                rows = _read_relation_tuples(self.input()[0])
+                out = []
+                for _, tup in rows:
+                    renamed = {}
+                    for k, v in tup.items():
+                        renamed[f"{q.relname}.{k.split('.')[-1]}"] = v
+                    out.append((q.relname, renamed))
+                _write_relation_tuples(self.output(), out)
+            except Exception:
+                _write_relation_tuples(self.output(), [])
+                raise
+            return
+        super().run()
+
+
+class JoinTask(RelAlgQueryTask):
+    def requires(self):
+        q = radb.parse.one_statement_from_string(self.querystring)
+        left = task_factory(q.inputs[0], self.step + 1, self.exec_environment)
+        right = task_factory(q.inputs[1], self.step + count_steps(q.inputs[0]) + 1, self.exec_environment)
+        return [left, right]
+
+    def run(self):
+        if self.exec_environment in (ExecEnv.MOCK, ExecEnv.LOCAL):
+            try:
+                q = radb.parse.one_statement_from_string(self.querystring)
+                left_rows = _read_relation_tuples(self.input()[0])
+                right_rows = _read_relation_tuples(self.input()[1])
+
+                out = []
+                for _, lt in left_rows:
+                    for _, rt in right_rows:
+                        merged = dict(lt)
+                        merged.update(rt)
+                        if eval_pred(q.cond, merged):
+                            out.append(("Join", merged))
+
+                _write_relation_tuples(self.output(), out)
+            except Exception:
+                _write_relation_tuples(self.output(), [])
+                raise
+            return
+        super().run()
+
+
+if __name__ == "__main__":
     luigi.run()
