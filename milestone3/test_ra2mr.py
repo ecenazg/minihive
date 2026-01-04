@@ -3,7 +3,7 @@ import json
 import luigi
 import radb
 
-import milestone3.ra2mr as ra2mr
+import milestone3.ra2mr_original as ra2mr
 
 '''
 Requires that pytest and pytest-repeat are installed.

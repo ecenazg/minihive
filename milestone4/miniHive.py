@@ -1,5 +1,6 @@
 import argparse
 import glob
+from pickletools import optimize
 import luigi
 import os
 import radb
@@ -8,9 +9,9 @@ import radb.parse
 import sqlparse
 
 import costcounter
-import sql2ra
-import raopt
-import ra2mr
+import sql2ra as sql2ra
+import raopt as raopt
+import ra2mr as ra2mr
 
 
 def clear_local_tmpfiles():
@@ -20,9 +21,10 @@ def clear_local_tmpfiles():
 
 
 def eval(sf, env, query, dd, optimize):
-    stmt = sqlparse.parse(query)[0]
+    if query is None or query.strip() == "":
+        return None
 
-    ''' ...................... you may edit code below ........................'''
+    stmt = sqlparse.parse(query)[0]
 
     ra0 = sql2ra.translate(stmt)
 
@@ -31,12 +33,16 @@ def eval(sf, env, query, dd, optimize):
     ra3 = raopt.rule_merge_selections(ra2)
     ra4 = raopt.rule_introduce_joins(ra3)
 
-    task = ra2mr.task_factory(ra4, env=env, optimize=optimize)
+    if optimize:
+        ra4 = raopt.rule_push_down_projections(ra4, dd)
+        ra4 = raopt.rule_remove_redundant_projects(ra4)
 
-    ''' ...................... you may edit code above ........................'''
+
+    task = ra2mr.task_factory(ra4, env=env, optimize=optimize)
 
     luigi.build([task], local_scheduler=True)
     return task
+
 
 
 if __name__ == "__main__":
