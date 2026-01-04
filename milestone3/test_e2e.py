@@ -5,9 +5,9 @@ import luigi
 import sqlparse
 
 from milestone3 import ra2mr as ra2mr
-from milestone3 import raopt
-from milestone3 import sql2ra
-from milestone3 import test_ra2mr
+from milestone3 import raopt as raopt
+from milestone3 import sql2ra as sql2ra
+from milestone3 import test_ra2mr as test_ra2mr
 
 
 '''

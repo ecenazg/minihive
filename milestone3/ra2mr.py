@@ -48,6 +48,8 @@ def count_steps(node):
 class RelAlgQueryTask(luigi.contrib.hadoop.JobTask, OutputMixin):
     querystring = luigi.Parameter()
     step = luigi.IntParameter(default=1)
+    optimize = luigi.BoolParameter(default=False)
+
 
     def output(self):
         if self.exec_environment == ExecEnv.HDFS:
@@ -58,7 +60,8 @@ class RelAlgQueryTask(luigi.contrib.hadoop.JobTask, OutputMixin):
 
 
 
-def task_factory(node, step=1, env=ExecEnv.HDFS):
+def task_factory(node, step=1, env=ExecEnv.HDFS, optimize=False):
+
     if isinstance(node, radb.ast.Select):
         return SelectTask(querystring=str(node) + ";", step=step, exec_environment=env)
     if isinstance(node, radb.ast.Project):
@@ -217,7 +220,8 @@ def eval_pred(expr, tup):
 class SelectTask(RelAlgQueryTask):
     def requires(self):
         q = radb.parse.one_statement_from_string(self.querystring)
-        return [task_factory(q.inputs[0], self.step + 1, self.exec_environment)]
+        return [task_factory(q.inputs[0], self.step + 1, self.exec_environment, optimize=optimize)]
+
 
     def run(self):
         if self.exec_environment in (ExecEnv.MOCK, ExecEnv.LOCAL):
