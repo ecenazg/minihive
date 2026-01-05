@@ -410,65 +410,51 @@ def _all_attrs_for_relation(relname, schema_dict):
         return set()
     return {(None, a) for a in schema_dict[relname].keys()}
 
+
 def rule_push_down_projections(expr, schema_dict):
     """
     SAFE projection pushdown:
       - reduces width before joins/crosses (major cost savings)
-      - pushes through Rename as "relation rename only"
+      - pushes through Rename as "relation rename only" (matches your MR RenameTask behavior)
       - never risks dropping join/selection predicate attributes
       - conservative for ambiguous unqualified attrs
-
-    Hybrid key strategy (important for your MR runtime):
-      - Base RelRef projections are UNQUALIFIED by default (AttrRef(None, name))
-      - BUT if an attribute name appears in multiple base relations (ambiguous),
-        project it QUALIFIED (AttrRef(rel, name)) to avoid collisions/regressions.
     """
     attr_to_rel = build_attribute_to_relation_map(schema_dict)
 
     def recurse(node, required_keys):
-        # ⛔ Guard: never push projections above a Join with no requirements
-        if isinstance(node, ra.Join) and not required_keys:
-            return node
 
-        # -------------------------
-        # Base relation
-        # -------------------------
+        if isinstance(node, ra.Join) and required_keys:
+            left, right = node.inputs
+
+            left_aliases = relation_aliases(left)
+            right_aliases = relation_aliases(right)
+
+            used_left = any(rel in left_aliases for (rel, _) in required_keys if rel is not None)
+            used_right = any(rel in right_aliases for (rel, _) in required_keys if rel is not None)
+ 
+
+            if used_left ^ used_right:
+                return node
+            
         if isinstance(node, ra.RelRef):
             if not required_keys:
                 return node
-
-            all_keys = _all_attrs_for_relation(node.rel, schema_dict)  # {(None, attr), ...}
+            all_keys = _all_attrs_for_relation(node.rel, schema_dict)
             keep = required_keys & all_keys
             if not keep:
                 return node
-
-            # avoid useless projection (almost full width)
-            if len(keep) >= 0.8 * len(all_keys):
-                return node
-
-            attrs = []
-            for (_r, name) in sorted(keep):
-                # If name exists in multiple relations, qualify it at the leaf to be safe.
-                rels = attr_to_rel.get(name, set())
-                if len(rels) > 1:
-                    attrs.append(ra.AttrRef(node.rel, name))
-                else:
-                    attrs.append(ra.AttrRef(None, name))
-
+            attrs = [_make_attrref(None, name) for (_r, name) in sorted(keep)]
             return ra.Project(attrs, node)
 
-        # -------------------------
-        # Rename
-        # -------------------------
+        # Rename: push required names below (unqualified),
+        # because your runtime keys use suffix matching and RenameTask rewrites prefixes.
         if isinstance(node, ra.Rename):
             # below rename, request by name only
             child_required = {(None, n) for n in _required_names(required_keys)} if required_keys else set()
             new_child = recurse(node.inputs[0], child_required)
             return ra.Rename(node.relname, node.attrnames, new_child)
 
-        # -------------------------
-        # Project
-        # -------------------------
+        # Project: its own attr list defines what is available above
         if isinstance(node, ra.Project):
             proj_keys = _collect_attr_keys_from_attrlist(node.attrs)
 
@@ -482,46 +468,34 @@ def rule_push_down_projections(expr, schema_dict):
             new_child = recurse(node.inputs[0], child_required)
             return ra.Project(node.attrs, new_child)
 
-        # -------------------------
-        # Select
-        # -------------------------
+        # Select: must keep attrs needed by predicate
         if isinstance(node, ra.Select):
             cond_keys = _collect_attr_keys_from_expr(node.cond)
             child_required = set(required_keys) | cond_keys
             new_child = recurse(node.inputs[0], child_required)
             return ra.Select(node.cond, new_child)
 
-        # -------------------------
-        # Join
-        # -------------------------
+        # Join: must keep attrs needed by join cond + above requirements
         if isinstance(node, ra.Join):
             cond_keys = _collect_attr_keys_from_expr(node.cond)
             needed = set(required_keys) | cond_keys
 
             left, right = node.inputs
-            left_req, right_req = _split_required_for_children(
-                needed, left, right, schema_dict, attr_to_rel
-            )
+            left_req, right_req = _split_required_for_children(needed, left, right, schema_dict, attr_to_rel)
 
             new_left = recurse(left, left_req)
             new_right = recurse(right, right_req)
             return ra.Join(new_left, node.cond, new_right)
 
-        # -------------------------
-        # Cross
-        # -------------------------
+        # Cross: split requirements conservatively
         if isinstance(node, ra.Cross):
             left, right = node.inputs
-            left_req, right_req = _split_required_for_children(
-                set(required_keys), left, right, schema_dict, attr_to_rel
-            )
+            left_req, right_req = _split_required_for_children(set(required_keys), left, right, schema_dict, attr_to_rel)
             new_left = recurse(left, left_req)
             new_right = recurse(right, right_req)
             return ra.Cross(new_left, new_right)
 
-        # -------------------------
-        # Set operations
-        # -------------------------
+        # Set operations: require same schema on both sides
         if isinstance(node, ra.SetOp):
             left = recurse(node.inputs[0], set(required_keys))
             right = recurse(node.inputs[1], set(required_keys))
@@ -567,4 +541,57 @@ def rule_remove_redundant_projects(expr):
             rule_remove_redundant_projects(expr.inputs[1])
         )
 
+    return expr
+
+def rule_remove_redundant_selects(expr):
+    if isinstance(expr, ra.Select):
+        child = rule_remove_redundant_selects(expr.inputs[0])
+        if isinstance(child, ra.Select):
+            return ra.Select(
+                ra.ValExprBinaryOp(expr.cond, sym.AND, child.cond),
+                child.inputs[0]
+            )
+        return ra.Select(expr.cond, child)
+
+    if hasattr(expr, "inputs"):
+        expr.inputs = [rule_remove_redundant_selects(c) for c in expr.inputs]
+    return expr
+
+def rule_reorder_joins(expr):
+    if isinstance(expr, ra.Join):
+        left = rule_reorder_joins(expr.inputs[0])
+        right = rule_reorder_joins(expr.inputs[1])
+
+        # Heuristic: prefer Select(...) on the left
+        if isinstance(right, ra.Select) and not isinstance(left, ra.Select):
+            return ra.Join(right, expr.cond, left)
+
+        return ra.Join(left, expr.cond, right)
+
+    if hasattr(expr, "inputs"):
+        expr.inputs = [rule_reorder_joins(c) for c in expr.inputs]
+    return expr
+
+
+def rule_remove_redundant_distinct(expr, schema_dict):
+    if isinstance(expr, ra.Project):
+        if len(expr.attrs) == 1:
+            attr = expr.attrs[0]
+            if attr.name.endswith("KEY"):
+                return rule_remove_redundant_distinct(expr.inputs[0], schema_dict)
+    return expr
+
+def rule_reorder_joins(expr):
+    if isinstance(expr, ra.Join):
+        left = rule_reorder_joins(expr.inputs[0])
+        right = rule_reorder_joins(expr.inputs[1])
+
+        # Heuristic: prefer Select(...) on the left
+        if isinstance(right, ra.Select) and not isinstance(left, ra.Select):
+            return ra.Join(right, expr.cond, left)
+
+        return ra.Join(left, expr.cond, right)
+
+    if hasattr(expr, "inputs"):
+        expr.inputs = [rule_reorder_joins(c) for c in expr.inputs]
     return expr

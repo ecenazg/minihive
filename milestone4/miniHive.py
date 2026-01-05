@@ -34,9 +34,11 @@ def eval(sf, env, query, dd, optimize):
     ra4 = raopt.rule_introduce_joins(ra3)
 
     if optimize:
+        ra4 = raopt.rule_reorder_joins(ra4)
+        ra4 = raopt.rule_merge_selections(ra4)
+        ra4 = raopt.rule_remove_redundant_distinct(ra4, dd)
         ra4 = raopt.rule_push_down_projections(ra4, dd)
         ra4 = raopt.rule_remove_redundant_projects(ra4)
-
 
     task = ra2mr.task_factory(ra4, env=env, optimize=optimize)
 
